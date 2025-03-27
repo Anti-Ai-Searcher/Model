@@ -1,2 +1,5 @@
 .mypy_cache/
 data/
+logs/
+images/
+detector/__pycache__/
