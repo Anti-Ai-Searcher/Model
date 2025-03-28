@@ -218,7 +218,7 @@ def run(max_epochs=None,
 
     best_validation_loss = float('inf')
     patience, patience_counter = 5, 0
-    early_stop_threshold = 0.0002
+    early_stop_threshold = 0.002
 
     for epoch in range(1, max_epochs + 1):
         if world_size > 1:
