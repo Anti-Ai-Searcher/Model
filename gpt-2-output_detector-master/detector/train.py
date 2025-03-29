@@ -12,11 +12,17 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.optim import Adam
 from torch.utils.data import DataLoader, DistributedSampler, RandomSampler
 from tqdm import tqdm
-from transformers import *
+from transformers import (
+    RobertaTokenizer,
+    RobertaForSequenceClassification,
+    RobertaConfig,
+    tokenization_utils,
+)
+# 로컬에 있는 다른 모듈들
+from dataset import Corpus, EncodedDataset
+from download import download
+from utils import summary, distributed
 
-from .dataset import Corpus, EncodedDataset
-from .download import download
-from .utils import summary, distributed
 
 def setup_distributed(port=29500):
     if not dist.is_available() or not torch.cuda.is_available() or torch.cuda.device_count() <= 1:
@@ -36,8 +42,19 @@ def setup_distributed(port=29500):
     dist.init_process_group(backend="nccl", init_method="env://")
     return dist.get_rank(), dist.get_world_size()
 
-def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
-                  max_sequence_length, random_sequence_length, epoch_size=None, token_dropout=None, seed=None):
+
+def load_datasets(data_dir,
+                  real_dataset,
+                  fake_dataset,
+                  tokenizer,
+                  batch_size,
+                  max_sequence_length,
+                  random_sequence_length,
+                  epoch_size=None,
+                  token_dropout=None,
+                  seed=None):
+
+    # fake_dataset 종류에 따라 적절히 다운로드
     if fake_dataset == 'TWO':
         download(real_dataset, 'xl-1542M', 'xl-1542M-nucleus', data_dir=data_dir)
     elif fake_dataset == 'THREE':
@@ -47,6 +64,7 @@ def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
 
     real_corpus = Corpus(real_dataset, data_dir=data_dir)
 
+    # fake_dataset가 TWO, THREE 인 경우(데이터 증폭 로직)
     if fake_dataset == "TWO":
         real_train, real_valid = real_corpus.train * 2, real_corpus.valid * 2
         fake_corpora = [Corpus(name, data_dir=data_dir) for name in ['xl-1542M', 'xl-1542M-nucleus']]
@@ -60,23 +78,41 @@ def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
         fake_valid = sum([corpus.valid for corpus in fake_corpora], [])
     else:
         fake_corpus = Corpus(fake_dataset, data_dir=data_dir)
-
         real_train, real_valid = real_corpus.train, real_corpus.valid
         fake_train, fake_valid = fake_corpus.train, fake_corpus.valid
 
     Sampler = DistributedSampler if distributed() and dist.get_world_size() > 1 else RandomSampler
 
     min_sequence_length = 10 if random_sequence_length else None
-    train_dataset = EncodedDataset(real_train, fake_train, tokenizer, max_sequence_length, min_sequence_length,
-                                   epoch_size, token_dropout, seed)
-    train_loader = DataLoader(train_dataset, batch_size, sampler=Sampler(train_dataset), num_workers=0)
+    train_dataset = EncodedDataset(
+        real_train,
+        fake_train,
+        tokenizer,
+        max_sequence_length,
+        min_sequence_length,
+        epoch_size,
+        token_dropout,
+        seed
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size,
+        sampler=Sampler(train_dataset),
+        num_workers=0
+    )
 
     validation_dataset = EncodedDataset(real_valid, fake_valid, tokenizer)
-    validation_loader = DataLoader(validation_dataset, batch_size=1, sampler=Sampler(validation_dataset))
+    validation_loader = DataLoader(
+        validation_dataset,
+        batch_size=1,
+        sampler=Sampler(validation_dataset)
+    )
 
     return train_loader, validation_loader
 
+
 def accuracy_sum(logits, labels):
+    # logits이 [batch, 2] 형태라면 두 번째 로짓이 더 크면(즉 class=1)으로 분류
     if list(logits.shape) == list(labels.shape) + [2]:
         classification = (logits[..., 0] < logits[..., 1]).long().flatten()
     else:
@@ -84,9 +120,9 @@ def accuracy_sum(logits, labels):
     assert classification.shape == labels.shape
     return (classification == labels).float().sum().item()
 
+
 def train(model: nn.Module, optimizer, device: str, loader: DataLoader, desc='Train'):
     model.train()
-
     train_accuracy = 0
     train_epoch_size = 0
     train_loss = 0
@@ -97,7 +133,12 @@ def train(model: nn.Module, optimizer, device: str, loader: DataLoader, desc='Tr
             batch_size = texts.shape[0]
 
             optimizer.zero_grad()
+            # outputs = model(texts, attention_mask=masks, labels=labels)
+            # loss, logits = outputs.loss, outputs.logits
+            # (위처럼 최신 Transformers 버전이면 이렇게 써야 합니다. 
+            #  다만 아래와 같은 구버전 스타일도 허용되는 버전이 있습니다.)
             loss, logits = model(texts, attention_mask=masks, labels=labels)
+
             loss.backward()
             optimizer.step()
 
@@ -114,6 +155,7 @@ def train(model: nn.Module, optimizer, device: str, loader: DataLoader, desc='Tr
         "train/loss": train_loss
     }
 
+
 def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='Validation'):
     model.eval()
 
@@ -121,8 +163,10 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
     validation_epoch_size = 0
     validation_loss = 0
 
-    records = [record for v in range(votes) for record in tqdm(loader, desc=f'Preloading data ... {v}',
-                                                               disable=distributed() and dist.get_rank() > 0)]
+    # 여러 번 돌려서 ensemble voting 비슷하게 쓰려는 구조
+    records = [record for v in range(votes) for record in tqdm(
+        loader, desc=f'Preloading data ... {v}', disable=distributed() and dist.get_rank() > 0
+    )]
     records = [[records[v * len(loader) + i] for v in range(votes)] for i in range(len(loader))]
 
     with tqdm(records, desc=desc, disable=distributed() and dist.get_rank() > 0) as loop, torch.no_grad():
@@ -130,6 +174,7 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
             losses = []
             logit_votes = []
 
+            # example은 (texts, masks, labels)가 votes번 반복되는 리스트
             for texts, masks, labels in example:
                 texts, masks, labels = texts.to(device), masks.to(device), labels.to(device)
                 batch_size = texts.shape[0]
@@ -138,8 +183,8 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
                 losses.append(loss)
                 logit_votes.append(logits)
 
-            loss = torch.stack(losses).mean(dim=0)
-            logits = torch.stack(logit_votes).mean(dim=0)
+            loss = torch.stack(losses).mean(dim=0)      # 여러 번의 loss 평균
+            logits = torch.stack(logit_votes).mean(dim=0)  # 여러 번의 logits 평균
 
             batch_accuracy = accuracy_sum(logits, labels)
             validation_accuracy += batch_accuracy
@@ -154,7 +199,9 @@ def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='V
         "validation/loss": validation_loss
     }
 
+
 def _all_reduce_dict(d, device):
+    # 분산 학습 시 각 노드의 메트릭 합산
     output_d = {}
     for (key, value) in sorted(d.items()):
         tensor_input = torch.tensor([[value]]).to(device)
@@ -162,6 +209,7 @@ def _all_reduce_dict(d, device):
             dist.all_reduce(tensor_input)
         output_d[key] = tensor_input.item()
     return output_d
+
 
 def run(max_epochs=None,
         device=None,
@@ -193,9 +241,14 @@ def run(max_epochs=None,
         dist.barrier()
 
     model_name = 'roberta-large' if large else 'roberta-base'
+
+    # 토크나이저 및 모델 설정
     tokenization_utils.logger.setLevel('ERROR')
     tokenizer = RobertaTokenizer.from_pretrained(model_name)
-    model = RobertaForSequenceClassification.from_pretrained(model_name).to(device)
+
+    # 🔴 수정 포인트: num_labels=2를 반드시 설정
+    config = RobertaConfig.from_pretrained(model_name, num_labels=2)
+    model = RobertaForSequenceClassification.from_pretrained(model_name, config=config).to(device)
 
     if rank == 0:
         summary(model)
@@ -205,9 +258,18 @@ def run(max_epochs=None,
     if world_size > 1:
         model = DistributedDataParallel(model, [rank], output_device=rank, find_unused_parameters=True)
 
-    train_loader, validation_loader = load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
-                                                    max_sequence_length, random_sequence_length, epoch_size,
-                                                    token_dropout, seed)
+    train_loader, validation_loader = load_datasets(
+        data_dir,
+        real_dataset,
+        fake_dataset,
+        tokenizer,
+        batch_size,
+        max_sequence_length,
+        random_sequence_length,
+        epoch_size,
+        token_dropout,
+        seed
+    )
 
     optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     logdir = os.environ.get("OPENAI_LOGDIR", "logs")
@@ -218,7 +280,9 @@ def run(max_epochs=None,
 
     best_validation_loss = float('inf')
     patience, patience_counter = 5, 0
-    early_stop_threshold = 0.002
+
+    # 🔴 수정 포인트: 너무 엄격하던 early_stop_threshold를 다소 완화
+    early_stop_threshold = 0.01  # 예: 0.01로 변경
 
     for epoch in range(1, max_epochs + 1):
         if world_size > 1:
@@ -249,11 +313,13 @@ def run(max_epochs=None,
 
             current_loss = combined_metrics["validation/loss"]
 
+            # Early stopping & 모델 저장
             if current_loss < early_stop_threshold and current_loss < best_validation_loss:
                 best_validation_loss = current_loss
                 patience_counter = 0
                 model_to_save = model.module if hasattr(model, 'module') else model
-                torch.save(dict(
+                torch.save(
+                    dict(
                         epoch=epoch,
                         model_state_dict=model_to_save.state_dict(),
                         optimizer_state_dict=optimizer.state_dict(),
@@ -282,14 +348,14 @@ def run(max_epochs=None,
         fig, ax1 = plt.subplots()
         ax2 = ax1.twinx()
 
-        ax1.plot(df["epoch"], df["train_accuracy"], label="Train Accuracy", color="blue", linestyle="-")
-        ax1.plot(df["epoch"], df["val_accuracy"], label="Validation Accuracy", color="green", linestyle="-")
+        ax1.plot(df["epoch"], df["train_accuracy"], label="Train Accuracy")
+        ax1.plot(df["epoch"], df["val_accuracy"], label="Validation Accuracy")
         ax1.set_ylabel("Accuracy")
         ax1.set_xlabel("Epoch")
         ax1.set_ylim(0, 1)
 
-        ax2.plot(df["epoch"], df["train_loss"], label="Train Loss", color="red", linestyle="--")
-        ax2.plot(df["epoch"], df["val_loss"], label="Validation Loss", color="orange", linestyle="--")
+        ax2.plot(df["epoch"], df["train_loss"], label="Train Loss", linestyle="--")
+        ax2.plot(df["epoch"], df["val_loss"], label="Validation Loss", linestyle="--")
         ax2.set_ylabel("Loss")
 
         lines, labels = ax1.get_legend_handles_labels()
@@ -299,6 +365,7 @@ def run(max_epochs=None,
         plt.title("Training & Validation Metrics over Epochs")
         plt.tight_layout()
         plt.savefig(os.path.join(logdir, "training_summary_plot.png"))
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -318,8 +385,10 @@ if __name__ == '__main__':
     parser.add_argument('--weight-decay', type=float, default=0)
     args = parser.parse_args()
 
-    nproc = int(subprocess.check_output([sys.executable, '-c', "import torch;"
-                                         "print(torch.cuda.device_count() if torch.cuda.is_available() else 1)"]))
+    nproc = int(subprocess.check_output([
+        sys.executable, '-c',
+        "import torch; print(torch.cuda.device_count() if torch.cuda.is_available() else 1)"
+    ]))
     if nproc > 1:
         print(f'Launching {nproc} processes ...', file=sys.stderr)
 
