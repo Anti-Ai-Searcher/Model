@@ -19,9 +19,9 @@ from transformers import (
     tokenization_utils,
 )
 # 로컬에 있는 다른 모듈들
-from dataset import Corpus, EncodedDataset
-from download import download
-from utils import summary, distributed
+from .dataset import Corpus, EncodedDataset
+from .download import download
+from .utils import summary, distributed
 
 
 def setup_distributed(port=29500):
