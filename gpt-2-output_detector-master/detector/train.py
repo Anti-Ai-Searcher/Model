@@ -282,7 +282,7 @@ def run(max_epochs=None,
     patience, patience_counter = 5, 0
 
     # 🔴 수정 포인트: 너무 엄격하던 early_stop_threshold를 다소 완화
-    early_stop_threshold = 0.01  # 예: 0.01로 변경
+    early_stop_threshold = 0.1  # 예: 0.1로 변경
 
     for epoch in range(1, max_epochs + 1):
         if world_size > 1:
