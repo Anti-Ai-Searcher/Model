@@ -165,6 +165,7 @@ def run(max_epochs=None,
         learning_rate=2e-5,
         weight_decay=0,
         patience=5,
+        model_path = None,
         **kwargs):
     args = locals()
 
@@ -178,6 +179,12 @@ def run(max_epochs=None,
     tokenization_utils.logger.setLevel('ERROR')
     tokenizer = RobertaTokenizer.from_pretrained(model_name)
     model = RobertaForSequenceClassification.from_pretrained(model_name).to(device)
+    
+    if model_path is not None:
+        checkpoint = torch.load(model_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        model.to(device)
+        model.train()
 
     summary(model)
 
@@ -282,6 +289,7 @@ if __name__ == '__main__':
     parser.add_argument('--learning-rate', type=float, default=2e-5)
     parser.add_argument('--weight-decay', type=float, default=0)
     parser.add_argument('--patience', type=int, default=5)
+    parser.add_argument('--model-path', type=str, default=None)
     args = parser.parse_args()
 
     run(**vars(args))

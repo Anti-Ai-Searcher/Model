@@ -76,7 +76,9 @@ def test(model: nn.Module, device: str, loader: DataLoader, desc='test'):
     plt.xlabel('Predicted')
     plt.ylabel('True')
     plt.title('Confusion Matrix')
-    plt.show()
+    plt.savefig("confusion_matrix.png")
+    
+    
 
     return {
         "test/accuracy": test_accuracy / test_epoch_size,
