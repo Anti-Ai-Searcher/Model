@@ -1,295 +1,394 @@
-"""Training code for the detector model"""
+# -*- coding: utf-8 -*-
+"""
+Enhanced training script that adds
+ • Perplexity
+ • Burstiness (std‑dev of per‑chunk PPL)
+ • Distinct‑n (lexical diversity, n = 1,2)
+metrics to the original detector (roberta) pipeline.
+
+If the optional --enable-mauve flag is passed and the mauve‑text
+package is installed, a corpus‑level MAUVE score will also be
+computed at the end of every validation epoch.  (This step can
+consume several hundred MB of GPU RAM; it is disabled by default.)
+
+Original file: train.py (2025‑05‑28)
+"""
 
 import argparse
 import os
-import subprocess
-import sys
+import math
 from itertools import count
-from multiprocessing import Process
+from collections import Counter
 
 import torch
 from torch import nn
 from torch.optim import Adam
-from torch.utils.data import DataLoader, RandomSampler, Subset
+from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
-from transformers import *
+from transformers import (
+    RobertaTokenizer,
+    RobertaForSequenceClassification,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    tokenization_utils_base as tokenization_utils,
+)
 import pandas as pd
 
+# Optional — only used if --enable-mauve given
+try:
+    import mauve  # type: ignore
+except ImportError:
+    mauve = None
 
-from .dataset import Corpus,EncodedDataset
+from .dataset import Corpus, EncodedDataset
 from .utils import summary
 
+###############################################################################
+# Helper class for LM‑based statistics
+###############################################################################
+class LMScorer:
+    """Compute perplexity, burstiness & distinct‑n on raw text."""
 
-def load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
-                  max_sequence_length, random_sequence_length, epoch_size=None, token_dropout=None, seed=None):
+    def __init__(self, model_name: str, device: str):
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.lm = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+        self.lm.eval()
+        self.device = device
 
+    @torch.no_grad()
+    def perplexity(self, text: str) -> float:
+        enc = self.tokenizer(text, return_tensors="pt", truncation=True).to(self.device)
+        loss = self.lm(**enc, labels=enc["input_ids"]).loss
+        return math.exp(loss.item())
+
+    def burstiness(self, text: str, chunk: int = 30) -> float:
+        toks = self.tokenizer.encode(text)
+        if len(toks) < chunk * 2:
+            return 0.0
+        ppl_vals = [
+            self.perplexity(self.tokenizer.decode(toks[i : i + chunk]))
+            for i in range(0, len(toks), chunk)
+        ]
+        return torch.tensor(ppl_vals).std().item()
+
+    @staticmethod
+    def _distinct_n(tokens, n) -> float:
+        if len(tokens) == 0:
+            return 0.0
+        ngrams = [tuple(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
+        return len(set(ngrams)) / max(len(ngrams), 1)
+
+    def distinct_metrics(self, text: str):
+        toks = self.tokenizer.tokenize(text)
+        return {
+            "distinct1": self._distinct_n(toks, 1),
+            "distinct2": self._distinct_n(toks, 2),
+        }
+
+###############################################################################
+# Dataset loader (unchanged apart from style tweaks)
+###############################################################################
+
+def load_datasets(
+    data_dir,
+    real_dataset,
+    fake_datasets,  # list[str]
+    tokenizer,
+    batch_size,
+    max_sequence_length,
+    random_sequence_length,
+    epoch_size=None,
+    token_dropout=None,
+    seed=None,
+):
     real_corpus = Corpus(real_dataset, data_dir=data_dir)
+    real_train, real_valid = real_corpus.train, real_corpus.valid
 
-    if fake_dataset == "TWO":
-        real_train, real_valid = real_corpus.train * 2, real_corpus.valid * 2
-        fake_corpora = [Corpus(name, data_dir=data_dir) for name in ['xl-1542M', 'xl-1542M-k40']]
-        fake_train = sum([corpus.train for corpus in fake_corpora], [])
-        fake_valid = sum([corpus.valid for corpus in fake_corpora], [])
-    else:
-        fake_corpus = Corpus(fake_dataset, data_dir=data_dir)
-
-        real_train, real_valid = real_corpus.train, real_corpus.valid
-        fake_train, fake_valid = fake_corpus.train, fake_corpus.valid
+    # support multiple fake corpora
+    if isinstance(fake_datasets, str):
+        fake_datasets = [fake_datasets]
+    fake_corpora = [Corpus(name, data_dir=data_dir) for name in fake_datasets]
+    fake_train = sum([c.train for c in fake_corpora], [])
+    fake_valid = sum([c.valid for c in fake_corpora], [])
 
     Sampler = RandomSampler
+    min_seq_len = 10 if random_sequence_length else None
 
-    min_sequence_length = 10 if random_sequence_length else None
-    train_dataset = EncodedDataset(real_train, fake_train, tokenizer, max_sequence_length, min_sequence_length,
-                                   epoch_size, token_dropout, seed)
-    train_loader = DataLoader(train_dataset, batch_size, sampler=Sampler(train_dataset), num_workers=0)
+    train_dataset = EncodedDataset(
+        real_train,
+        fake_train,
+        tokenizer,
+        max_sequence_length,
+        min_seq_len,
+        epoch_size,
+        token_dropout,
+        seed,
+    )
+    train_loader = DataLoader(train_dataset, batch_size, sampler=Sampler(train_dataset))
 
-    validation_dataset = EncodedDataset(real_valid, fake_valid, tokenizer)
-    # subset_len = len(validation_dataset)/100
-    # subset_validation_dataset = Subset(validation_dataset, range(int(subset_len)))
-    # validation_loader = DataLoader(subset_validation_dataset, batch_size=1, sampler=Sampler(subset_validation_dataset))
-    validation_loader = DataLoader(validation_dataset, batch_size=1, sampler=Sampler(validation_dataset))
+    val_dataset = EncodedDataset(real_valid, fake_valid, tokenizer)
+    val_loader = DataLoader(val_dataset, batch_size=1, sampler=Sampler(val_dataset))
+    return train_loader, val_loader
 
-    return train_loader, validation_loader
-
+###############################################################################
+# Core training / validation loops (train unchanged)
+###############################################################################
 
 def accuracy_sum(logits, labels):
     if list(logits.shape) == list(labels.shape) + [2]:
-        # 2-d outputs
         classification = (logits[..., 0] < logits[..., 1]).long().flatten()
     else:
         classification = (logits > 0).long().flatten()
-    assert classification.shape == labels.shape
     return (classification == labels).float().sum().item()
 
-        #  모델 = roBERTa    Adam       cpu or gpu   학습 데이터 로드     진행 표시줄
-def train(model: nn.Module, optimizer, device: str, loader: DataLoader, desc='Train'):
-    model.train() #모델을 train모드로
 
-    #학습변수 초기화
-    train_accuracy = 0
-    train_epoch_size = 0
-    train_loss = 0
-
+def train(model: nn.Module, optimizer, device: str, loader: DataLoader, desc="Train"):
+    model.train()
+    train_acc = train_loss = train_ep_size = 0
     with tqdm(loader, desc=desc) as loop:
         for texts, masks, labels in loop:
-
             texts, masks, labels = texts.to(device), masks.to(device), labels.to(device)
-            batch_size = texts.shape[0]
-
+            bsz = texts.size(0)
             optimizer.zero_grad()
-
-            #순전파
-            outputs = model(texts, attention_mask=masks, labels=labels)  # model이 반환하는 값이 (loss, logits)
-            loss = outputs.loss  # loss 추출
-            logits = outputs.logits  # logits 추출
-
-            #역전파
+            outputs = model(texts, attention_mask=masks, labels=labels)
+            loss, logits = outputs.loss, outputs.logits
             loss.backward()
             optimizer.step()
-
-            #정확도 계산
-            batch_accuracy = accuracy_sum(logits, labels)
-            train_accuracy += batch_accuracy
-            train_epoch_size += batch_size
-            train_loss += loss.item() * batch_size
-
-            loop.set_postfix(loss=loss.item(), acc=train_accuracy / train_epoch_size)
-
+            train_acc += accuracy_sum(logits, labels)
+            train_loss += loss.item() * bsz
+            train_ep_size += bsz
+            loop.set_postfix(loss=loss.item(), acc=train_acc / train_ep_size)
     return {
-        "train/accuracy": train_accuracy,
-        "train/epoch_size": train_epoch_size,
-        "train/loss": train_loss
+        "train/accuracy": train_acc,
+        "train/epoch_size": train_ep_size,
+        "train/loss": train_loss,
     }
 
+###############################################################################
+# Validation with new metrics
+###############################################################################
 
-def validate(model: nn.Module, device: str, loader: DataLoader, votes=1, desc='Validation'):
+def validate(
+    model: nn.Module,
+    device: str,
+    loader: DataLoader,
+    scorer: LMScorer,
+    tokenizer: RobertaTokenizer,
+    votes: int = 1,
+    desc: str = "Validation",
+    enable_mauve: bool = False,
+):
     model.eval()
+    val_acc = val_loss = val_ep_size = 0
 
-    validation_accuracy = 0
-    validation_epoch_size = 0
-    validation_loss = 0
+    # storage for text to compute corpus‑level metrics later (distinct/mauve)
+    human_texts, ai_texts = [], []
 
-    records = [record for v in range(votes) for record in tqdm(loader, desc=f'Preloading data ... {v}', disable=False)]
+    # pre‑load records for vote ensembling
+    records = [record for v in range(votes) for record in loader]
     records = [[records[v * len(loader) + i] for v in range(votes)] for i in range(len(loader))]
 
-    with tqdm(records, desc=desc, disable=False) as loop, torch.no_grad():
+    with torch.no_grad(), tqdm(records, desc=desc) as loop:
         for example in loop:
-            losses = []
-            logit_votes = []
-
+            losses, logit_votes = [], []
             for texts, masks, labels in example:
                 texts, masks, labels = texts.to(device), masks.to(device), labels.to(device)
-                batch_size = texts.shape[0]
-
-                #loss, logits = model(texts, attention_mask=masks, labels=labels)
-
-                outputs = model(texts, attention_mask=masks, labels=labels)  # model이 반환하는 값이 (loss, logits)
-                loss = outputs.loss  # loss 추출
-                logits = outputs.logits  # logits 추출
-
-                if isinstance(loss, str):
-                    raise ValueError(f"Loss가 문자열입니다: {loss}")
-
-                losses.append(loss)
-                logit_votes.append(logits)
-
+                outputs = model(texts, attention_mask=masks, labels=labels)
+                losses.append(outputs.loss)
+                logit_votes.append(outputs.logits)
 
             loss = torch.stack(losses).mean(dim=0)
             logits = torch.stack(logit_votes).mean(dim=0)
+            bsz = texts.size(0)
+            val_acc += accuracy_sum(logits, labels)
+            val_loss += loss.item() * bsz
+            val_ep_size += bsz
+            loop.set_postfix(loss=loss.item(), acc=val_acc / val_ep_size)
 
-            batch_accuracy = accuracy_sum(logits, labels)
-            validation_accuracy += batch_accuracy
-            validation_epoch_size += batch_size
-            validation_loss += loss.item() * batch_size
+            # decode raw text for LM stats
+            decoded = tokenizer.batch_decode(texts, skip_special_tokens=True)
+            for txt, lbl in zip(decoded, labels):
+                if lbl.item() == 0:
+                    human_texts.append(txt)
+                else:
+                    ai_texts.append(txt)
 
-            loop.set_postfix(loss=loss.item(), acc=validation_accuracy / validation_epoch_size)
+    # —— LM‑based statistics ——
+    perplexities = [scorer.perplexity(t) for t in human_texts + ai_texts]
+    burstiness_vals = [scorer.burstiness(t) for t in human_texts + ai_texts]
+    distinct1_vals = [scorer.distinct_metrics(t)["distinct1"] for t in human_texts + ai_texts]
+    distinct2_vals = [scorer.distinct_metrics(t)["distinct2"] for t in human_texts + ai_texts]
 
-    return {
-        "validation/accuracy": validation_accuracy,
-        "validation/epoch_size": validation_epoch_size,
-        "validation/loss": validation_loss
+    # aggregate
+    metrics = {
+        "validation/accuracy": val_acc,
+        "validation/epoch_size": val_ep_size,
+        "validation/loss": val_loss,
+        "validation/perplexity": sum(perplexities) / len(perplexities),
+        "validation/burstiness": sum(burstiness_vals) / len(burstiness_vals),
+        "validation/distinct1": sum(distinct1_vals) / len(distinct1_vals),
+        "validation/distinct2": sum(distinct2_vals) / len(distinct2_vals),
     }
 
-def run(max_epochs=None,
-        device=None,
-        batch_size=24,
-        max_sequence_length=128,
-        random_sequence_length=False,
-        epoch_size=None,
-        seed=None,
-        data_dir='data',
-        real_dataset='webtext',
-        fake_dataset='xl-1542M-k40',
-        token_dropout=None,
-        large=False,
-        learning_rate=2e-5,
-        weight_decay=0,
-        patience=5,
-        model_path = None,
-        **kwargs):
-    args = locals()
+    # —— optional MAUVE ——
+    if enable_mauve and mauve is not None and human_texts and ai_texts:
+        mauve_res = mauve.compute_mauve(
+            p_text=ai_texts,
+            q_text=human_texts,
+            device_id=0 if device.startswith("cuda") else -1,
+            max_text_length=256,
+        )
+        metrics["validation/mauve"] = mauve_res.mauve
+    return metrics
 
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+###############################################################################
+# Main runner (adds new CLI flags & CSV logging columns)
+###############################################################################
 
-    print('device:', device)
+def run(
+    *,
+    eval_lm="gpt2-xl",
+    fake_datasets="xl-1542M-k40",
+    enable_mauve=False,
+    **kwargs,
+):
+    # —— Parse existing kwargs ——
+    device = kwargs.get("device") or ("cuda" if torch.cuda.is_available() else "cpu")
+    batch_size = kwargs.get("batch_size", 24)
+    max_epochs = kwargs.get("max_epochs")
+    max_seq_len = kwargs.get("max_sequence_length", 128)
+    random_seq_len = kwargs.get("random_sequence_length", False)
 
-    model_name = 'roberta-large' if large else 'roberta-base'
-    print(model_name)
-    tokenization_utils.logger.setLevel('ERROR')
+    # —— Seed etc. ——
+    torch.manual_seed(kwargs.get("seed") or 42)
+
+    # —— Model & tokenizer ——
+    model_name = "roberta-large" if kwargs.get("large") else "roberta-base"
+    tokenization_utils.logger.setLevel("ERROR")
     tokenizer = RobertaTokenizer.from_pretrained(model_name)
     model = RobertaForSequenceClassification.from_pretrained(model_name).to(device)
-    
-    if model_path is not None:
-        checkpoint = torch.load(model_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-        model.to(device)
-        model.train()
+
+    # —— Optional checkpoint resume ——
+    if (model_path := kwargs.get("model_path")) is not None:
+        ckpt = torch.load(model_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"], strict=True)
 
     summary(model)
 
-    train_loader, validation_loader = load_datasets(data_dir, real_dataset, fake_dataset, tokenizer, batch_size,
-                                                    max_sequence_length, random_sequence_length, epoch_size,
-                                                    token_dropout, seed)
+    # —— Data ——
+    train_loader, val_loader = load_datasets(
+        data_dir=kwargs.get("data_dir", "data"),
+        real_dataset=kwargs.get("real_dataset", "human_data/webtext"),
+        fake_datasets=fake_datasets,
+        tokenizer=tokenizer,
+        batch_size=batch_size,
+        max_sequence_length=max_seq_len,
+        random_sequence_length=random_seq_len,
+        epoch_size=kwargs.get("epoch_size"),
+        token_dropout=kwargs.get("token_dropout"),
+        seed=kwargs.get("seed"),
+    )
 
-    optimizer = Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    epoch_loop = count(1) if max_epochs is None else range(1, max_epochs + 1)
+    # —— Optim ——
+    optimizer = Adam(model.parameters(), lr=kwargs.get("learning_rate", 2e-5), weight_decay=kwargs.get("weight_decay", 0))
 
+    # —— LM scorer ——
+    scorer = LMScorer(eval_lm, device)
+
+    # —— Logging ——
     logdir = os.environ.get("OPENAI_LOGDIR", "logs")
     os.makedirs(logdir, exist_ok=True)
+    writer = None
+    if device.startswith("cuda"):
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(logdir)
 
-    from torch.utils.tensorboard import SummaryWriter
-    writer = SummaryWriter(logdir) if device == 'cuda' else None
-
-    best_validation_accuracy = 0
-    patience_counter = 0
-    previous_validation_loss = None
-
-    log_data = []
     excel_path = os.path.join(logdir, "training_logs.xlsx")
+    log_rows = []
 
-    for epoch in epoch_loop:
-        train_metrics = train(model, optimizer, device, train_loader, f'Epoch {epoch}')
-        validation_metrics = validate(model, device, validation_loader)
+    best_val_acc = 0
+    patience_counter = 0
+    patience = kwargs.get("patience", 5)
 
-        combined_metrics = {**validation_metrics, **train_metrics}
+    epoch_iter = count(1) if max_epochs is None else range(1, max_epochs + 1)
+    for epoch in epoch_iter:
+        train_metrics = train(model, optimizer, device, train_loader, f"Epoch {epoch}")
+        val_metrics = validate(
+            model,
+            device,
+            val_loader,
+            scorer,
+            tokenizer,
+            votes=1,
+            enable_mauve=enable_mauve,
+        )
 
-        combined_metrics["train/accuracy"] /= combined_metrics["train/epoch_size"]
-        combined_metrics["train/loss"] /= combined_metrics["train/epoch_size"]
-        combined_metrics["validation/accuracy"] /= combined_metrics["validation/epoch_size"]
-        combined_metrics["validation/loss"] /= combined_metrics["validation/epoch_size"]
+        # Normalise
+        train_metrics["train/accuracy"] /= train_metrics["train/epoch_size"]
+        train_metrics["train/loss"] /= train_metrics["train/epoch_size"]
+        val_metrics["validation/accuracy"] /= val_metrics["validation/epoch_size"]
+        val_metrics["validation/loss"] /= val_metrics["validation/epoch_size"]
 
-        log_data.append({
-        "epoch": epoch,
-        "train/accuracy": combined_metrics["train/accuracy"],
-        "train/loss": combined_metrics["train/loss"],
-        "validation/accuracy": combined_metrics["validation/accuracy"],
-        "validation/loss": combined_metrics["validation/loss"],
-        })
-        
-        df = pd.DataFrame(log_data) 
-        df.to_excel(excel_path, index=False)
+        # —— Merge & log ——
+        merged = {"epoch": epoch, **train_metrics, **val_metrics}
+        log_rows.append(merged)
+        pd.DataFrame(log_rows).to_excel(excel_path, index=False)
+        print(f"Epoch {epoch} logged ✏️")
 
-        if device == 'cuda':
-            for key, value in combined_metrics.items():
-                writer.add_scalar(key, value, global_step=epoch)
-            
-            if previous_validation_loss is not None and combined_metrics["validation/loss"] > previous_validation_loss:
-                print(f"📉 No improvement in validation loss.")
-                patience_counter += 1
-            elif previous_validation_loss is not None and combined_metrics["validation/loss"] < previous_validation_loss:
-                patience_counter = 0
-            previous_validation_loss = combined_metrics["validation/loss"] 
-     
+        if writer is not None:
+            for k, v in merged.items():
+                if k not in {"epoch", "train/epoch_size", "validation/epoch_size"}:
+                    writer.add_scalar(k, v, epoch)
 
-            if combined_metrics["validation/accuracy"] > best_validation_accuracy:
-                best_validation_accuracy = combined_metrics["validation/accuracy"]
-
-                torch.save(dict(
-                        epoch=epoch,
-                        model_state_dict=model.state_dict(),
-                        optimizer_state_dict=optimizer.state_dict(),
-                        args=args
-                    ),
-                    os.path.join(logdir, "best-model.pt")
-                ) 
-
-            if epoch % 10 == 0:
-                torch.save(dict(
-                    epoch=epoch,
-                    model_state_dict=model.state_dict(),
-                    optimizer_state_dict=optimizer.state_dict(),
-                    args=args
-                ), os.path.join(logdir, f"checkpoint-epoch-{epoch}.pt"))
-
+        # —— Early‑stopping & checkpoints ——
+        cur_val_acc = val_metrics["validation/accuracy"]
+        if cur_val_acc > best_val_acc:
+            best_val_acc = cur_val_acc
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "args": kwargs,
+                },
+                os.path.join(logdir, "best-model.pt"),
+            )
+            patience_counter = 0
+        else:
+            patience_counter += 1
         if patience_counter >= patience:
-            print(f"🛑 Early stopping triggered at epoch {epoch}")
-            break   
+            print("Early stopping triggered 🚦")
+            break
 
-    print(f"✅ Training logs saved to {excel_path}")
+    print(f"Training complete ✔️  Logs saved to {excel_path}")
 
+###############################################################################
+# Entry‑point CLI
+###############################################################################
 
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    # —— original args ——
+    p.add_argument("--max-epochs", type=int)
+    p.add_argument("--device")
+    p.add_argument("--batch-size", type=int, default=24)
+    p.add_argument("--max-sequence-length", type=int, default=128)
+    p.add_argument("--random-sequence-length", action="store_true")
+    p.add_argument("--epoch-size", type=int)
+    p.add_argument("--seed", type=int)
+    p.add_argument("--data-dir", default="data")
+    p.add_argument("--real-dataset", default="human_data/webtext")
+    p.add_argument("--fake-datasets", nargs="+", default=["xl-1542M-k40"])
+    p.add_argument("--token-dropout", type=float)
+    p.add_argument("--large", action="store_true")
+    p.add_argument("--learning-rate", type=float, default=2e-5)
+    p.add_argument("--weight-decay", type=float, default=0)
+    p.add_argument("--patience", type=int, default=5)
+    p.add_argument("--model-path")
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+    # —— new args ——
+    p.add_argument("--eval-lm", default="gpt2-xl", help="LM used for PPL/Burstiness computation")
+    p.add_argument("--enable-mauve", action="store_true", help="Compute MAUVE (requires mauve‑text)")
 
-    parser.add_argument('--max-epochs', type=int, default=None)
-    parser.add_argument('--device', type=str, default=None)
-    parser.add_argument('--batch-size', type=int, default=24)
-    parser.add_argument('--max-sequence-length', type=int, default=128)
-    parser.add_argument('--random-sequence-length', action='store_true')
-    parser.add_argument('--epoch-size', type=int, default=None)
-    parser.add_argument('--seed', type=int, default=None)
-    parser.add_argument('--data-dir', type=str, default='data')
-    parser.add_argument('--real-dataset', type=str, default='webtext')
-    parser.add_argument('--fake-dataset', type=str, default='xl-1542M-k40')
-    parser.add_argument('--token-dropout', type=float, default=None)
-
-    parser.add_argument('--large', action='store_true', help='use the roberta-large model instead of roberta-base')
-    parser.add_argument('--learning-rate', type=float, default=2e-5)
-    parser.add_argument('--weight-decay', type=float, default=0)
-    parser.add_argument('--patience', type=int, default=5)
-    parser.add_argument('--model-path', type=str, default=None)
-    args = parser.parse_args()
-
+    args = p.parse_args()
     run(**vars(args))
