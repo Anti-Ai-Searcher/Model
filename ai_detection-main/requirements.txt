@@ -7,3 +7,4 @@ tensorboard>=1.14.0
 scikit-learn
 matplotlib
 openpyxl
+sentencepiece
